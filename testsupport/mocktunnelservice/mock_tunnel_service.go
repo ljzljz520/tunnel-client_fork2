@@ -65,6 +65,17 @@ func WithPollHandler(handler func(http.ResponseWriter, *http.Request) bool) Opti
 	}
 }
 
+// WithResponseHandler installs test-only behavior on POST .../response after
+// authentication and before the payload is decoded and matched against
+// expected responses. Returning true means the handler wrote the complete
+// response (for example to inject a retryable status); false continues normal
+// response recording. The handler must be concurrency-safe.
+func WithResponseHandler(handler func(http.ResponseWriter, *http.Request) bool) Option {
+	return func(mock *MockTunnelService) {
+		mock.responseHandler = handler
+	}
+}
+
 // WithSessionHeaderPropagation enables automatic propagation of MCP session headers between
 // responses and subsequent commands.
 func WithSessionHeaderPropagation() Option {
@@ -251,6 +262,7 @@ type MockTunnelService struct {
 	pollStatus          int
 	pollFailures        int
 	pollHandler         func(http.ResponseWriter, *http.Request) bool
+	responseHandler     func(http.ResponseWriter, *http.Request) bool
 
 	tb atomic.Value // testing.TB
 }
@@ -929,6 +941,9 @@ func (m *MockTunnelService) handleResponse(w http.ResponseWriter, r *http.Reques
 	}
 	if got := m.extractTunnelID(r.URL.Path, "/response"); got != m.tunnelID {
 		m.failf("unexpected tunnel_id %q in response path", got)
+	}
+	if m.responseHandler != nil && m.responseHandler(w, r) {
+		return
 	}
 
 	var payload wiretypes.TunnelResponsePayload

@@ -10,6 +10,7 @@ import (
 
 	"github.com/jpillora/backoff"
 	"github.com/openai/tunnel-client/pkg/controlplane"
+	"github.com/openai/tunnel-client/pkg/payloadbudget"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -53,6 +54,16 @@ type poller struct {
 	health         *controlplane.PollHealth
 	hadPollError   bool
 	retrySleep     func(context.Context, time.Duration) bool
+	// payloadBudget optionally throttles command admission before enqueue.
+	// nil disables budgeting.
+	payloadBudget *payloadbudget.Budget
+}
+
+// SetPayloadBudget attaches the shared optional link payload byte budget.
+// When attached, each measured command reserves its bytes before entering the
+// queue; the reservation then travels with the command.
+func (p *poller) SetPayloadBudget(b *payloadbudget.Budget) {
+	p.payloadBudget = b
 }
 
 // NewPoller builds a Poller with sensible defaults for retry and queue
@@ -239,10 +250,28 @@ func (p *poller) Run(ctx context.Context) {
 			}
 
 			p.recordCommandAge(ctx, tc)
+			// Reserve payload bytes before the command enters the queue. The
+			// reservation travels with the command through execution and
+			// delivery; an oversized payload is marked rejected and enqueued so
+			// the processor answers it without executing the tool.
+			if !p.admitPayload(ctx, tc) {
+				droppedContextClosed++
+				for _, rest := range commands[idx+1:] {
+					restTC, ok := rest.(typedCommand)
+					if !ok || restTC.commandType() == "" {
+						droppedInvalidType++
+						continue
+					}
+					droppedContextClosed++
+				}
+				break
+			}
 			if !p.enqueueWithBackpressure(ctx, tc) {
 				// We already pulled this command from the control-plane; if the client is
-				// shutting down we can't safely block forever. Count the remaining
-				// commands as dropped due to context closure.
+				// shutting down we can't safely block forever. Release any bytes
+				// reserved for it (it never reaches the processor), then count the
+				// remaining commands as dropped due to context closure.
+				releasePayloadReservation(tc)
 				droppedContextClosed++
 				for _, rest := range commands[idx+1:] {
 					restTC, ok := rest.(typedCommand)
@@ -275,6 +304,45 @@ func (p *poller) Run(ctx context.Context) {
 
 func (p *poller) enqueue(ctx context.Context, cmd controlplane.PolledCommand) bool {
 	return p.queue.Enqueue(ctx, cmd)
+}
+
+// admitPayload reserves the command's measured bytes before queueing. It
+// returns false only when the context ended while waiting for quota (shutdown).
+// A payload larger than the whole budget can never fit, so instead of waiting
+// it is marked rejected and still enqueued: the processor replies with an
+// error without performing any tool operation.
+func (p *poller) admitPayload(ctx context.Context, cmd controlplane.PolledCommand) bool {
+	b := p.payloadBudget
+	if b == nil {
+		return true
+	}
+	carrier, ok := cmd.(controlplane.PayloadBudgetCarrier)
+	if !ok || carrier.PayloadBytes() <= 0 {
+		return true
+	}
+	reservation, err := b.Acquire(ctx, carrier.PayloadBytes())
+	if err == nil {
+		carrier.AttachPayloadReservation(reservation)
+		return true
+	}
+	if errors.Is(err, payloadbudget.ErrPayloadTooLarge) {
+		carrier.MarkPayloadAdmissionRejected(err)
+		p.logger.WarnContext(ctx, "rejecting polled command whose payload exceeds the link byte budget",
+			slog.Int64("payload_bytes", carrier.PayloadBytes()),
+			slog.Int64("budget_bytes", b.Limit()),
+			slog.String(tclog.FieldRequestID, cmd.RequestID().String()),
+		)
+		return true
+	}
+	return false
+}
+
+// releasePayloadReservation returns any bytes attached to a command that never
+// reached the processor (for example shutdown while queueing).
+func releasePayloadReservation(cmd controlplane.PolledCommand) {
+	if carrier, ok := cmd.(controlplane.PayloadBudgetCarrier); ok {
+		carrier.ReleasePayloadReservation()
+	}
 }
 
 func (p *poller) enqueueWithBackpressure(ctx context.Context, cmd controlplane.PolledCommand) bool {

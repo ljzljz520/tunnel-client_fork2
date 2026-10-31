@@ -98,6 +98,9 @@ func convertRawCommand(raw wiretypes.RawJSONRPCPolledCommand, polledAt time.Time
 	if err != nil {
 		return nil, err
 	}
+	// The JSON-RPC payload is the request body the link forwards to the MCP
+	// server; its size is what the payload budget accounts for.
+	base.setPayloadBytes(int64(len(raw.JSONRPC)))
 	traceContext := parseTraceContext(raw.TraceContext)
 	commandTraceContext := traceContext
 	for name := range raw.Headers {

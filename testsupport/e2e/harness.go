@@ -29,6 +29,7 @@ import (
 	"github.com/openai/tunnel-client/pkg/harpoon"
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/oauth"
+	"github.com/openai/tunnel-client/pkg/payloadbudget"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/types"
@@ -203,6 +204,7 @@ type Harness struct {
 	DeliveryHealth   *controlplane.DeliveryHealth
 	QueueHealth      *controlplane.QueueHealth
 	DispatcherHealth *dispatcher.ActivityHealth
+	PayloadBudget    *payloadbudget.Budget
 	cfg              *config.Config
 	app              *fxtest.App
 	clients          []*TunnelClient
@@ -638,11 +640,12 @@ func (h *Harness) startTunnelClient(t testing.TB) *TunnelClient {
 		deliveryHealth   *controlplane.DeliveryHealth
 		queueHealth      *controlplane.QueueHealth
 		dispatcherHealth *dispatcher.ActivityHealth
+		payloadBudget    *payloadbudget.Budget
 	)
 	options := []fx.Option{
 		fx.Provide(func() io.Writer { return logWriter }),
 		fx.WithLogger(func(*slog.Logger) fxevent.Logger { return fxevent.NopLogger }),
-		fx.Populate(&harpoonRegistry, &mcpProbeState, &oauthState, &startupCatalog, &pollHealth, &deliveryHealth, &queueHealth, &dispatcherHealth),
+		fx.Populate(&harpoonRegistry, &mcpProbeState, &oauthState, &startupCatalog, &pollHealth, &deliveryHealth, &queueHealth, &dispatcherHealth, &payloadBudget),
 		fx.Decorate(func(fetcher controlplane.Fetcher) controlplane.Fetcher {
 			return poller.wrap(fetcher, h.commandObserver)
 		}),
@@ -676,6 +679,7 @@ func (h *Harness) startTunnelClient(t testing.TB) *TunnelClient {
 		h.DeliveryHealth = deliveryHealth
 		h.QueueHealth = queueHealth
 		h.DispatcherHealth = dispatcherHealth
+		h.PayloadBudget = payloadBudget
 	}
 	return client
 }

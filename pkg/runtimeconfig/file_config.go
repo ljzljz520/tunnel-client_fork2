@@ -44,21 +44,23 @@ type fileConfig struct {
 }
 
 type fileControlPlaneConfig struct {
-	BaseURL               *string           `yaml:"base_url"`
-	URLPath               *string           `yaml:"url_path"`
-	TunnelID              *string           `yaml:"tunnel_id"`
-	OrganizationID        *string           `yaml:"organization_id"`
-	APIKey                *string           `yaml:"api_key"`
-	AWSIdentityProviderID *string           `yaml:"aws_identity_provider_id"`
-	AWSServiceAccountID   *string           `yaml:"aws_service_account_id"`
-	ClientCert            *string           `yaml:"client_cert"`
-	ClientKey             *string           `yaml:"client_key"`
-	HTTPProxy             *string           `yaml:"http_proxy"`
-	MaxInFlightRequests   *int              `yaml:"max_inflight_requests"`
-	PollTimeout           *string           `yaml:"poll_timeout"`
-	PollDeadlineGuardrail *string           `yaml:"poll_deadline_guardrail"`
-	PollChannels          []string          `yaml:"poll_channels"`
-	ExtraHeaders          map[string]string `yaml:"extra_headers"`
+	BaseURL                 *string           `yaml:"base_url"`
+	URLPath                 *string           `yaml:"url_path"`
+	TunnelID                *string           `yaml:"tunnel_id"`
+	OrganizationID          *string           `yaml:"organization_id"`
+	APIKey                  *string           `yaml:"api_key"`
+	AWSIdentityProviderID   *string           `yaml:"aws_identity_provider_id"`
+	AWSServiceAccountID     *string           `yaml:"aws_service_account_id"`
+	ClientCert              *string           `yaml:"client_cert"`
+	ClientKey               *string           `yaml:"client_key"`
+	HTTPProxy               *string           `yaml:"http_proxy"`
+	MaxInFlightRequests     *int              `yaml:"max_inflight_requests"`
+	MaxInFlightPayloadBytes *int64            `yaml:"max_inflight_payload_bytes"`
+	MaxPollFrameBytes       *int64            `yaml:"max_poll_frame_bytes"`
+	PollTimeout             *string           `yaml:"poll_timeout"`
+	PollDeadlineGuardrail   *string           `yaml:"poll_deadline_guardrail"`
+	PollChannels            []string          `yaml:"poll_channels"`
+	ExtraHeaders            map[string]string `yaml:"extra_headers"`
 }
 
 type fileLogConfig struct {
@@ -355,6 +357,8 @@ func (c fileConfig) toEnv(lookupEnv func(string) (string, bool)) (map[string]str
 	setString(env, "CONTROL_PLANE_CLIENT_KEY", c.ControlPlane.ClientKey)
 	setString(env, "CONTROL_PLANE_HTTP_PROXY", c.ControlPlane.HTTPProxy)
 	setInt(env, "CONTROL_PLANE_MAX_INFLIGHT_REQUESTS", c.ControlPlane.MaxInFlightRequests)
+	setInt64(env, "CONTROL_PLANE_MAX_INFLIGHT_PAYLOAD_BYTES", c.ControlPlane.MaxInFlightPayloadBytes)
+	setInt64(env, "CONTROL_PLANE_MAX_POLL_FRAME_BYTES", c.ControlPlane.MaxPollFrameBytes)
 	setString(env, "CONTROL_PLANE_POLL_TIMEOUT", c.ControlPlane.PollTimeout)
 	setString(env, "CONTROL_PLANE_POLL_DEADLINE_GUARDRAIL", c.ControlPlane.PollDeadlineGuardrail)
 	if c.ControlPlane.PollChannels != nil {
@@ -501,6 +505,12 @@ func setBool(env map[string]string, key string, value *bool) {
 func setInt(env map[string]string, key string, value *int) {
 	if value != nil {
 		env[key] = strconv.Itoa(*value)
+	}
+}
+
+func setInt64(env map[string]string, key string, value *int64) {
+	if value != nil {
+		env[key] = strconv.FormatInt(*value, 10)
 	}
 }
 

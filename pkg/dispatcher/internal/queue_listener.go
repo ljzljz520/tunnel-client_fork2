@@ -183,6 +183,10 @@ func (l *QueueListener) run(ctx context.Context) {
 			l.logger.WarnContext(ctx, "failed to release dispatcher worker pool",
 				slog.String("error", err.Error()))
 		}
+		// In-flight workers release their own reservations as they finish;
+		// commands still buffered never reach the processor, so release their
+		// payload bytes here to avoid pinning the budget after shutdown.
+		l.drainQueuedReservations()
 		l.activityHealth.Stopped()
 	}()
 
@@ -220,6 +224,25 @@ func (l *QueueListener) run(ctx context.Context) {
 				}
 				continue
 			}
+		}
+	}
+}
+
+// drainQueuedReservations releases payload reservations held by commands left
+// in the queue at shutdown. Release is idempotent, so a command that is
+// concurrently finishing processing is never double-released.
+func (l *QueueListener) drainQueuedReservations() {
+	for {
+		select {
+		case cmd, ok := <-l.queue:
+			if !ok {
+				return
+			}
+			if carrier, ok := cmd.(controlplane.PayloadBudgetCarrier); ok {
+				carrier.ReleasePayloadReservation()
+			}
+		default:
+			return
 		}
 	}
 }

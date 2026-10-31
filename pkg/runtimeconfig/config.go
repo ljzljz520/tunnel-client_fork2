@@ -123,23 +123,27 @@ func resolveRequestIDForwarding(fs *pflag.FlagSet, lookupEnv func(string) (strin
 }
 
 const (
-	defaultControlPlaneBaseURL                         = "https://api.openai.com"
-	defaultControlPlaneMTLSBaseURL                     = "https://mtls.api.openai.com"
-	defaultControlPlaneMaxInFlight                     = 20
-	maxControlPlaneMaxInFlight                         = 10000
-	defaultControlPlanePollTimeout                     = 30 * time.Second
-	defaultControlPlaneInitialPollTimeout              = defaultControlPlanePollTimeout
-	defaultControlPlanePollDeadlineGuardrail           = 5000 * time.Millisecond
-	maxControlPlanePollDeadlineGuardrail               = time.Minute
-	maxControlPlanePollDeadline                        = 10 * time.Minute
-	defaultLogLevel                                    = "info"
-	defaultLogFormat                         LogFormat = LogFormatUnset
-	defaultHealthListenAddr                            = "127.0.0.1:8080"
-	defaultCloudflaredReadyTimeout                     = 30 * time.Second
-	defaultMCPConnectionMaxTTL                         = 10 * time.Minute
-	defaultMCPMaxConcurrentRequests                    = 10
-	DefaultHarpoonMaxResponseBytes                     = 100 * 1024
-	DefaultHarpoonMaxRedirects                         = 5
+	defaultControlPlaneBaseURL     = "https://api.openai.com"
+	defaultControlPlaneMTLSBaseURL = "https://mtls.api.openai.com"
+	defaultControlPlaneMaxInFlight = 20
+	maxControlPlaneMaxInFlight     = 10000
+	// Zero disables the optional link payload byte budget and the hard poll
+	// frame cap, preserving legacy unbounded behavior.
+	defaultControlPlaneMaxInFlightPayloadBytes           = 0
+	defaultControlPlaneMaxPollFrameBytes                 = 0
+	defaultControlPlanePollTimeout                       = 30 * time.Second
+	defaultControlPlaneInitialPollTimeout                = defaultControlPlanePollTimeout
+	defaultControlPlanePollDeadlineGuardrail             = 5000 * time.Millisecond
+	maxControlPlanePollDeadlineGuardrail                 = time.Minute
+	maxControlPlanePollDeadline                          = 10 * time.Minute
+	defaultLogLevel                                      = "info"
+	defaultLogFormat                           LogFormat = LogFormatUnset
+	defaultHealthListenAddr                              = "127.0.0.1:8080"
+	defaultCloudflaredReadyTimeout                       = 30 * time.Second
+	defaultMCPConnectionMaxTTL                           = 10 * time.Minute
+	defaultMCPMaxConcurrentRequests                      = 10
+	DefaultHarpoonMaxResponseBytes                       = 100 * 1024
+	DefaultHarpoonMaxRedirects                           = 5
 )
 
 // These full-client extension defaults live beside the canonical profile
@@ -282,15 +286,23 @@ type RuntimeConfig struct {
 
 // ControlPlaneConfig defines how the client reaches the tunnel control plane.
 type ControlPlaneConfig struct {
-	TraceContextEnabled   bool
-	BaseURL               *url.URL
-	UnixSocketPath        string
-	URLPath               string
-	TunnelID              types.TunnelID
-	OrganizationID        string
-	APIKey                string
-	TokenProvider         func(context.Context) (string, error) `json:"-" yaml:"-"`
-	MaxInFlightRequests   int
+	TraceContextEnabled bool
+	BaseURL             *url.URL
+	UnixSocketPath      string
+	URLPath             string
+	TunnelID            types.TunnelID
+	OrganizationID      string
+	APIKey              string
+	TokenProvider       func(context.Context) (string, error) `json:"-" yaml:"-"`
+	MaxInFlightRequests int
+	// MaxInFlightPayloadBytes optionally caps total request/response payload
+	// bytes reserved across poll decoding, queuing, MCP execution, and
+	// response delivery. Zero disables the byte budget.
+	MaxInFlightPayloadBytes int64
+	// MaxPollFrameBytes optionally caps the accepted size in bytes of a single
+	// poll response frame. An oversized frame is discarded atomically. Zero
+	// disables the hard cap.
+	MaxPollFrameBytes     int64
 	PollTimeout           time.Duration
 	InitialPollTimeout    time.Duration
 	PollDeadlineGuardrail time.Duration
@@ -652,6 +664,8 @@ func RegisterFlags(fs *pflag.FlagSet, flavor Flavor) {
 	fs.String("control-plane.client-key", "", "Path to PEM client private key for control-plane mTLS (format <path|env:VAR|file:/path>) (env.CONTROL_PLANE_CLIENT_KEY)")
 	fs.String("control-plane.http-proxy", "", "Outbound HTTP proxy for the control plane (format <url|env:VAR>)")
 	fs.Int("control-plane.max-inflight", defaultControlPlaneMaxInFlight, "Capacity of the local polled-command buffer; polling pauses while the buffer is full (env.CONTROL_PLANE_MAX_INFLIGHT_REQUESTS, max 10000)")
+	fs.Int64("control-plane.max-inflight-payload-bytes", defaultControlPlaneMaxInFlightPayloadBytes, "Optional total byte budget for payloads in flight across poll decoding, queuing, MCP execution, and response delivery; 0 disables it (env.CONTROL_PLANE_MAX_INFLIGHT_PAYLOAD_BYTES)")
+	fs.Int64("control-plane.max-poll-frame-bytes", defaultControlPlaneMaxPollFrameBytes, "Optional hard size cap in bytes for a single poll response frame; oversized frames are discarded atomically; 0 disables it (env.CONTROL_PLANE_MAX_POLL_FRAME_BYTES)")
 	fs.Duration("control-plane.poll-timeout", defaultControlPlanePollTimeout, "Long-poll timeout when fetching commands from the control plane (env.CONTROL_PLANE_POLL_TIMEOUT)")
 	fs.Duration("control-plane.initial-poll-timeout", defaultControlPlaneInitialPollTimeout, "Maximum requested wait for the first poll, capped by poll-timeout; does not shorten the client deadline (env.CONTROL_PLANE_INITIAL_POLL_TIMEOUT)")
 	fs.Duration("control-plane.poll-deadline-guardrail", defaultControlPlanePollDeadlineGuardrail, "Extra time after the requested long-poll wait before the control-plane HTTP/context deadline (env.CONTROL_PLANE_POLL_DEADLINE_GUARDRAIL)")
@@ -1307,6 +1321,25 @@ func buildControlPlaneConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, 
 		maxInFlight = val
 	}
 
+	maxInFlightPayloadBytes, err := parseNonNegativeByteLimit(
+		fs, lookupEnv,
+		"control-plane.max-inflight-payload-bytes",
+		"CONTROL_PLANE_MAX_INFLIGHT_PAYLOAD_BYTES",
+		defaultControlPlaneMaxInFlightPayloadBytes,
+	)
+	if err != nil {
+		return ControlPlaneConfig{}, err
+	}
+	maxPollFrameBytes, err := parseNonNegativeByteLimit(
+		fs, lookupEnv,
+		"control-plane.max-poll-frame-bytes",
+		"CONTROL_PLANE_MAX_POLL_FRAME_BYTES",
+		defaultControlPlaneMaxPollFrameBytes,
+	)
+	if err != nil {
+		return ControlPlaneConfig{}, err
+	}
+
 	pollTimeout := defaultControlPlanePollTimeout
 	if flag := fs.Lookup("control-plane.poll-timeout"); flag != nil && flag.Changed {
 		val, err := fs.GetDuration("control-plane.poll-timeout")
@@ -1404,23 +1437,55 @@ func buildControlPlaneConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, 
 	}
 
 	return ControlPlaneConfig{
-		BaseURL:                baseURL,
-		URLPath:                controlPlaneURLPath,
-		TunnelID:               types.TunnelID(tunnelID),
-		OrganizationID:         organizationID,
-		APIKey:                 apiKey,
-		TokenProvider:          tokenProvider,
-		MaxInFlightRequests:    maxInFlight,
-		PollTimeout:            pollTimeout,
-		InitialPollTimeout:     initialPollTimeout,
-		PollDeadlineGuardrail:  pollDeadlineGuardrail,
-		PollChannels:           pollChannels,
-		PollChannelsConfigured: pollChannelsConfigured,
-		ClientCertificate:      clientCertificate,
-		ExtraHeaders:           extraHeaders,
-		HTTPProxy:              httpProxy,
-		HTTPProxySource:        httpProxySource,
+		BaseURL:                 baseURL,
+		URLPath:                 controlPlaneURLPath,
+		TunnelID:                types.TunnelID(tunnelID),
+		OrganizationID:          organizationID,
+		APIKey:                  apiKey,
+		TokenProvider:           tokenProvider,
+		MaxInFlightRequests:     maxInFlight,
+		MaxInFlightPayloadBytes: maxInFlightPayloadBytes,
+		MaxPollFrameBytes:       maxPollFrameBytes,
+		PollTimeout:             pollTimeout,
+		InitialPollTimeout:      initialPollTimeout,
+		PollDeadlineGuardrail:   pollDeadlineGuardrail,
+		PollChannels:            pollChannels,
+		PollChannelsConfigured:  pollChannelsConfigured,
+		ClientCertificate:       clientCertificate,
+		ExtraHeaders:            extraHeaders,
+		HTTPProxy:               httpProxy,
+		HTTPProxySource:         httpProxySource,
 	}, nil
+}
+
+// parseNonNegativeByteLimit resolves an optional byte budget flag: explicit
+// flag wins, then environment, then def. Zero (the default) disables the
+// limit; negative values are rejected.
+func parseNonNegativeByteLimit(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), flagName, envName string, def int64) (int64, error) {
+	if flag := fs.Lookup(flagName); flag != nil && flag.Changed {
+		val, err := fs.GetInt64(flagName)
+		if err != nil {
+			return 0, fmt.Errorf("invalid value for --%s: %w", flagName, err)
+		}
+		if val < 0 {
+			return 0, fmt.Errorf("%s must be zero or greater", flagName)
+		}
+		return val, nil
+	}
+	if envVal, ok := lookupEnv(envName); ok {
+		if envVal == "" {
+			return 0, fmt.Errorf("%s must be zero or greater", envName)
+		}
+		val, err := strconv.ParseInt(envVal, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s: %w", envName, err)
+		}
+		if val < 0 {
+			return 0, fmt.Errorf("%s must be zero or greater", envName)
+		}
+		return val, nil
+	}
+	return def, nil
 }
 
 func resolvePollChannels(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) ([]types.Channel, bool, error) {

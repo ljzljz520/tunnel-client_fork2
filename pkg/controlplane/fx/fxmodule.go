@@ -9,6 +9,7 @@ import (
 	"slices"
 	"time"
 
+	otelmetric "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.uber.org/fx"
 
@@ -18,6 +19,7 @@ import (
 	tclog "github.com/openai/tunnel-client/pkg/log"
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/mcpserverinfo"
+	"github.com/openai/tunnel-client/pkg/payloadbudget"
 	"github.com/openai/tunnel-client/pkg/proxy"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
@@ -30,13 +32,28 @@ import (
 // Module wires control-plane polling into the Fx graph.
 var Module = fx.Module(
 	"controlplane",
-	fx.Provide(newMetadataState, newTunnelServiceClient, newPoller, controlplane.NewPollHealth, controlplane.NewDeliveryHealth,
+	fx.Provide(newPayloadBudget, newMetadataState, newTunnelServiceClient, newPoller, controlplane.NewPollHealth, controlplane.NewDeliveryHealth,
 		fx.Annotate(func(s *controlplane.PollHealth) healthstate.Component { return s }, fx.ResultTags(`group:"runtime_health_components"`)),
 		fx.Annotate(func(s *controlplane.DeliveryHealth) healthstate.Component { return s }, fx.ResultTags(`group:"runtime_health_components"`)),
 		fx.Annotate(newStartupCatalogReadinessGate, fx.ResultTags(`group:"runtime_readiness_gates"`)),
 	),
 	fx.Invoke(runMetadataFetch, runPoller),
 )
+
+// newPayloadBudget builds the process-wide optional payload byte budget shared
+// across poll admission, queuing, MCP execution, and response delivery. A zero
+// or absent limit yields a disabled (unlimited) budget.
+func newPayloadBudget(cfg *runtimeconfig.ControlPlaneConfig, meterProvider *sdkmetric.MeterProvider) *payloadbudget.Budget {
+	var meter otelmetric.Meter
+	if meterProvider != nil {
+		meter = meterProvider.Meter("payloadbudget")
+	}
+	limit := int64(0)
+	if cfg != nil {
+		limit = cfg.MaxInFlightPayloadBytes
+	}
+	return payloadbudget.New(limit, meter)
+}
 
 type fetcherParams struct {
 	fx.In
@@ -48,6 +65,7 @@ type fetcherParams struct {
 	Logging                         *runtimeconfig.LoggingConfig
 	Logger                          *slog.Logger
 	MeterProvider                   *sdkmetric.MeterProvider
+	PayloadBudget                   *payloadbudget.Budget        `optional:"true"`
 	PollHealth                      *controlplane.PollHealth     `optional:"true"`
 	DeliveryHealth                  *controlplane.DeliveryHealth `optional:"true"`
 	LegacyHarpoonProtocolForTesting bool                         `name:"legacy_harpoon_protocol_for_testing" optional:"true"`
@@ -90,6 +108,9 @@ func newTunnelServiceClient(p fetcherParams) (clientResult, error) {
 		return clientResult{}, err
 	}
 	client.ObserveHealth(p.PollHealth, p.DeliveryHealth)
+	if p.PayloadBudget != nil {
+		client.SetPayloadBudget(p.PayloadBudget)
+	}
 	route := proxy.ResolveRoute(proxy.RouteKindControlPlane, "control-plane", p.Config.BaseURL, p.Config.HTTPProxy, p.Config.HTTPProxySource, os.LookupEnv)
 	logFields := []any{
 		slog.String("route_kind", string(route.Kind)),
@@ -224,8 +245,15 @@ type pollerParams struct {
 	Fetcher            controlplane.Fetcher
 	Logger             *slog.Logger
 	MeterProvider      *sdkmetric.MeterProvider
+	PayloadBudget      *payloadbudget.Budget     `optional:"true"`
 	Health             *controlplane.PollHealth  `optional:"true"`
 	QueueHealth        *controlplane.QueueHealth `optional:"true"`
+}
+
+// payloadBudgetSetter is implemented by the concrete poller so the optional
+// byte budget can be attached without widening NewPoller's stable signature.
+type payloadBudgetSetter interface {
+	SetPayloadBudget(*payloadbudget.Budget)
 }
 
 func newPoller(p pollerParams) (internal.Poller, error) {
@@ -240,7 +268,16 @@ func newPoller(p pollerParams) (internal.Poller, error) {
 	}
 	meter := p.MeterProvider.Meter("controlplane")
 	pollTimeout := p.Config.PollTimeoutOrDefault()
-	return internal.NewPoller(queue, p.Fetcher, logger, meter, pollTimeout, p.Config.PollDeadlineGuardrail, p.Config.PollBackoffMin, p.Config.PollBackoffMax, p.Health)
+	poller, err := internal.NewPoller(queue, p.Fetcher, logger, meter, pollTimeout, p.Config.PollDeadlineGuardrail, p.Config.PollBackoffMin, p.Config.PollBackoffMax, p.Health)
+	if err != nil {
+		return nil, err
+	}
+	if p.PayloadBudget != nil {
+		if setter, ok := poller.(payloadBudgetSetter); ok {
+			setter.SetPayloadBudget(p.PayloadBudget)
+		}
+	}
+	return poller, nil
 }
 
 type runnerParams struct {

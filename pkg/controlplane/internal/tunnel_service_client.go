@@ -30,6 +30,7 @@ import (
 	wiretypes "github.com/openai/tunnel-client/pkg/controlplane/wiretypes"
 	tclog "github.com/openai/tunnel-client/pkg/log"
 	tcmetrics "github.com/openai/tunnel-client/pkg/metrics"
+	"github.com/openai/tunnel-client/pkg/payloadbudget"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"github.com/openai/tunnel-client/pkg/tlsconfig"
 	"github.com/openai/tunnel-client/pkg/tracing"
@@ -89,11 +90,24 @@ type TunnelServiceClient struct {
 	pollHealth                     *controlplane.PollHealth
 	deliveryHealth                 *controlplane.DeliveryHealth
 	routing                        pollRoutingState
+	// payloadBudget optionally throttles request admission and response
+	// delivery. nil disables budgeting.
+	payloadBudget *payloadbudget.Budget
+	// maxPollFrameBytes is the hard cap for a single poll response frame. Zero
+	// disables the cap.
+	maxPollFrameBytes int64
 }
 
 // ObserveHealth attaches process-local observers before the client starts work.
 func (c *TunnelServiceClient) ObserveHealth(poll *controlplane.PollHealth, delivery *controlplane.DeliveryHealth) {
 	c.pollHealth, c.deliveryHealth = poll, delivery
+}
+
+// SetPayloadBudget attaches the shared optional link payload byte budget. It
+// throttles oversized request admission in the poller and reserves response
+// bytes before the response body is allocated in PostResponse.
+func (c *TunnelServiceClient) SetPayloadBudget(b *payloadbudget.Budget) {
+	c.payloadBudget = b
 }
 
 // NewTunnelServiceClient constructs an HTTP-backed client using the provided runtimeconfig.
@@ -173,6 +187,7 @@ func NewTunnelServiceClient(ctx context.Context, cfg *runtimeconfig.ControlPlane
 		managedCloudflareRetryAttempts: defaultManagedCloudflareRetryAttempts,
 		newManagedCloudflareBackoff:    newControlPlaneBackoff,
 		retrySleep:                     sleepWithContext,
+		maxPollFrameBytes:              cfg.MaxPollFrameBytes,
 	}
 	if cfg.TokenProvider != nil {
 		// Do not attach a fresh bearer token to an HTTP redirect. Wrong-cluster
@@ -660,6 +675,20 @@ func (c *TunnelServiceClient) PostResponse(ctx context.Context, requestID types.
 		payload.JSONResponse = rawResponse
 	}
 
+	// Reserve the outgoing bytes before allocating the marshaled body, so a
+	// large response is throttled ahead of the big allocation. The same
+	// request's in-flight reservation is excluded to avoid deadlocking against
+	// its own quota. The reservation spans every HTTP retry attempt and is
+	// released after the terminal outcome; retries resend only these already
+	// serialized bytes and can never replay the tool operation, which ran once
+	// on the processor side.
+	held, _ := payloadbudget.ReservationFromContext(ctx)
+	deliveryReservation, err := c.reserveResponseDelivery(ctx, estimateResponsePayloadBytes(&payload), held)
+	if err != nil {
+		return "", fmt.Errorf("controlplane responder: await response payload budget: %w", err)
+	}
+	defer deliveryReservation.Release()
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("controlplane responder: marshal payload: %w", err)
@@ -771,6 +800,37 @@ func (c *TunnelServiceClient) PostResponse(ctx context.Context, requestID types.
 	}
 
 	return tunnelServiceRequestID, errors.New("controlplane responder: exhausted response retries")
+}
+
+// reserveResponseDelivery acquires delivery quota when the optional byte
+// budget is configured. A nil budget returns a nil reservation, whose Release
+// is a no-op.
+func (c *TunnelServiceClient) reserveResponseDelivery(ctx context.Context, estimatedBytes int64, held *payloadbudget.Reservation) (*payloadbudget.Reservation, error) {
+	if c.payloadBudget == nil || estimatedBytes <= 0 {
+		return nil, nil
+	}
+	return c.payloadBudget.AcquireDelivery(ctx, estimatedBytes, held)
+}
+
+// estimateResponsePayloadBytes is an intentionally generous upper bound on the
+// marshaled response body, computed before the allocation so quota can be
+// awaited first. Over-counting only releases a little extra quota early;
+// under-counting would let a large body skip throttling.
+func estimateResponsePayloadBytes(p *wiretypes.TunnelResponsePayload) int64 {
+	const envelopeSlack = 512
+	n := int64(len(p.JSONResponse)) + int64(len(p.RequestID)) + int64(len(p.Channel)) + envelopeSlack
+	for key, values := range p.ResponseHeaders {
+		n += int64(len(key)) + 8
+		for _, value := range values {
+			// JSON escaping can grow header values; count each twice as a
+			// conservative bound.
+			n += int64(len(value))*2 + 8
+		}
+	}
+	if p.ResponseTiming != nil {
+		n += 128
+	}
+	return n
 }
 
 func sanitizeMCPResponseHeaders(headers http.Header) http.Header {
@@ -936,12 +996,26 @@ func (c *TunnelServiceClient) Poll(ctx context.Context, limit int) ([]controlpla
 		c.routing.complete(attempt, nil, true, false)
 		return nil, tunnelServiceRequestID, nil
 	case http.StatusOK:
+		// Reject an oversized frame before allocating its body when the server
+		// declared its length. Chunked or unknown lengths are caught while
+		// reading in decodeCommands. The whole frame is discarded atomically.
+		if c.maxPollFrameBytes > 0 && resp.ContentLength > c.maxPollFrameBytes {
+			frameErr := fmt.Errorf("controlplane client: poll frame content-length %d exceeds %d byte limit: %w",
+				resp.ContentLength, c.maxPollFrameBytes, payloadbudget.ErrFrameTooLarge)
+			c.logger.ErrorContext(ctx, "poll frame exceeds configured byte limit; discarding frame",
+				slog.Int64("content_length", resp.ContentLength),
+				slog.Int64("max_frame_bytes", c.maxPollFrameBytes),
+			)
+			c.routing.complete(attempt, nil, false, false)
+			return nil, tunnelServiceRequestID, frameErr
+		}
 		cmds, err := c.decodeCommands(ctx, resp.Body, limit, receivedAt)
 		if err == nil {
 			c.routing.complete(attempt, nil, true, false)
 		} else if !errors.Is(ctx.Err(), context.Canceled) {
 			// An unreachable route may fail while reading the body, after headers
-			// have arrived. Malformed JSON alone does not evict a reachable route.
+			// have arrived. Malformed JSON alone does not evict a reachable route;
+			// neither does a deterministic oversized frame.
 			var networkErr net.Error
 			failed := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &networkErr)
 			c.routing.complete(attempt, nil, false, failed)
@@ -1047,15 +1121,38 @@ func pollTimeoutMilliseconds(timeout time.Duration) int64 {
 	return 1
 }
 
+// readPollFrame reads one complete poll response frame, enforcing the hard
+// frame cap when configured. At most maxPollFrameBytes+1 bytes are buffered so
+// an oversized frame is detected without buffering its full body; the caller
+// discards the frame atomically.
+func (c *TunnelServiceClient) readPollFrame(r io.Reader) ([]byte, error) {
+	if c.maxPollFrameBytes <= 0 {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, &pollingTransportError{cause: err}
+		}
+		return data, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(r, c.maxPollFrameBytes+1))
+	if err != nil {
+		return nil, &pollingTransportError{cause: err}
+	}
+	if int64(len(data)) > c.maxPollFrameBytes {
+		return nil, fmt.Errorf("controlplane client: poll frame exceeds %d byte limit: %w",
+			c.maxPollFrameBytes, payloadbudget.ErrFrameTooLarge)
+	}
+	return data, nil
+}
+
 func (c *TunnelServiceClient) decodeCommands(ctx context.Context, r io.Reader, limit int, polledAt time.Time) ([]controlplane.PolledCommand, error) {
 	limited := limit
 	if limited <= 0 {
 		limited = 1
 	}
 
-	data, err := io.ReadAll(r)
+	data, err := c.readPollFrame(r)
 	if err != nil {
-		return nil, &pollingTransportError{cause: err}
+		return nil, err
 	}
 
 	var envelope wiretypes.PolledCommandEnvelope
@@ -1124,6 +1221,9 @@ func (c *TunnelServiceClient) decodeCommands(ctx context.Context, r io.Reader, l
 				logger.WarnContext(ctx, "control-plane command dropped: invalid oauth_discovery payload", slog.String(tclog.FieldRequestID, od.RequestID), slog.String("error", err.Error()))
 				continue
 			}
+			// Non-JSON-RPC commands carry no dedicated payload section; the
+			// complete wire object is the conservative byte measurement.
+			cmd.setPayloadBytes(int64(len(raw)))
 			logPolledCommand(ctx, logger, od.BaseRawPolledCommand, polledAt)
 			out = append(out, cmd)
 		case wiretypes.CommandTypeSessionTermination:
@@ -1137,6 +1237,7 @@ func (c *TunnelServiceClient) decodeCommands(ctx context.Context, r io.Reader, l
 				logger.WarnContext(ctx, "control-plane command dropped: invalid session_termination payload", slog.String(tclog.FieldRequestID, termination.RequestID), slog.String("error", err.Error()))
 				continue
 			}
+			cmd.setPayloadBytes(int64(len(raw)))
 			logPolledCommand(ctx, logger, termination.BaseRawPolledCommand, polledAt)
 			out = append(out, cmd)
 		default:

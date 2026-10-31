@@ -7,6 +7,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 
+	"github.com/openai/tunnel-client/pkg/payloadbudget"
 	"github.com/openai/tunnel-client/pkg/types"
 )
 
@@ -51,6 +52,29 @@ type TraceContextProvider interface {
 
 type CommandTraceContextProvider interface {
 	CommandTraceContext() *types.TraceContext
+}
+
+// PayloadBytesProvider is an optional extension implemented by commands whose
+// wire payload has been measured. The byte count feeds the optional link
+// payload byte budget.
+type PayloadBytesProvider interface {
+	PayloadBytes() int64
+}
+
+// PayloadBudgetCarrier is implemented by polled commands that move a payload
+// byte-budget reservation through queuing, MCP execution, and response
+// delivery. The poller attaches the reservation after admission; the processor
+// releases it exactly once when processing finishes. Commands rejected at
+// admission (payload larger than the whole budget) carry the rejection reason
+// and hold no reservation, so the processor can answer them without executing
+// any tool operation.
+type PayloadBudgetCarrier interface {
+	PayloadBytesProvider
+	AttachPayloadReservation(*payloadbudget.Reservation)
+	PayloadReservation() *payloadbudget.Reservation
+	ReleasePayloadReservation()
+	MarkPayloadAdmissionRejected(reason error)
+	PayloadAdmissionError() error
 }
 
 // Fetcher abstracts the control-plane poll endpoint. Implementations should

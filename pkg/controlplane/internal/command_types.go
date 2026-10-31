@@ -8,11 +8,13 @@ import (
 
 	"github.com/openai/tunnel-client/pkg/controlplane"
 	"github.com/openai/tunnel-client/pkg/controlplane/wiretypes"
+	"github.com/openai/tunnel-client/pkg/payloadbudget"
 	"github.com/openai/tunnel-client/pkg/types"
 )
 
 var (
 	_ controlplane.ResponseDeadlineProvider  = (*basePolledCommand)(nil)
+	_ controlplane.PayloadBudgetCarrier      = (*basePolledCommand)(nil)
 	_ controlplane.PolledCommand             = (*oauthDiscoveryCommand)(nil)
 	_ controlplane.OauthDiscoveryCommand     = (*oauthDiscoveryCommand)(nil)
 	_ controlplane.PolledCommand             = (*jsonRpcCommand)(nil)
@@ -42,7 +44,51 @@ type basePolledCommand struct {
 	shardToken string
 	channel    types.Channel
 	deadline   *time.Time
+	// payloadBytes is the measured wire payload size used by the optional link
+	// payload byte budget. Zero means no measurement is available.
+	payloadBytes int64
+	// reservation holds the command's admitted byte budget while it travels
+	// through queuing, MCP execution, and response delivery. It is released
+	// exactly once by the processor (or the queue listener at shutdown).
+	reservation *payloadbudget.Reservation
+	// admissionErr is set when the command was rejected at budget admission;
+	// the processor must answer it without executing any tool operation.
+	admissionErr error
 }
+
+// PayloadBytes reports the measured payload size for the byte budget.
+func (c *basePolledCommand) PayloadBytes() int64 { return c.payloadBytes }
+
+func (c *basePolledCommand) setPayloadBytes(n int64) { c.payloadBytes = n }
+
+// AttachPayloadReservation records the reservation acquired at admission.
+func (c *basePolledCommand) AttachPayloadReservation(r *payloadbudget.Reservation) {
+	c.reservation = r
+}
+
+// PayloadReservation returns the reservation held for this command, if any.
+func (c *basePolledCommand) PayloadReservation() *payloadbudget.Reservation {
+	return c.reservation
+}
+
+// ReleasePayloadReservation returns the held bytes exactly once; it is safe to
+// call when no reservation is attached.
+func (c *basePolledCommand) ReleasePayloadReservation() {
+	if c.reservation != nil {
+		c.reservation.Release()
+		c.reservation = nil
+	}
+}
+
+// MarkPayloadAdmissionRejected records an admission rejection (for example a
+// payload larger than the whole budget) so the processor can answer without
+// executing the tool.
+func (c *basePolledCommand) MarkPayloadAdmissionRejected(reason error) {
+	c.admissionErr = reason
+}
+
+// PayloadAdmissionError returns the admission rejection reason, or nil.
+func (c *basePolledCommand) PayloadAdmissionError() error { return c.admissionErr }
 
 func (c *basePolledCommand) RequestID() types.RequestID { return c.requestID }
 func (c *basePolledCommand) EnqueuedAt() time.Time      { return c.enqueued }

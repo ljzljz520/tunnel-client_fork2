@@ -24,6 +24,7 @@ import (
 	tclog "github.com/openai/tunnel-client/pkg/log"
 	"github.com/openai/tunnel-client/pkg/mcpclient"
 	"github.com/openai/tunnel-client/pkg/oauth"
+	"github.com/openai/tunnel-client/pkg/payloadbudget"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon"
 	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
@@ -345,6 +346,19 @@ func (p *mcpProcessor) Process(ctx context.Context, cmd controlplane.PolledComma
 	}
 	logger := tclog.LoggerWithContextIdentifiers(ctx, p.logger)
 
+	// The request's payload-budget reservation (if any) travels with the
+	// command through execution and is released exactly once when processing
+	// ends. It is also exposed on the context so response delivery can exclude
+	// the request's own bytes.
+	var payloadCarrier controlplane.PayloadBudgetCarrier
+	if carrier, ok := cmd.(controlplane.PayloadBudgetCarrier); ok {
+		payloadCarrier = carrier
+		if reservation := carrier.PayloadReservation(); reservation != nil {
+			ctx = payloadbudget.ContextWithReservation(ctx, reservation)
+		}
+		defer carrier.ReleasePayloadReservation()
+	}
+
 	var cancel context.CancelFunc
 	if provider, ok := cmd.(controlplane.ResponseDeadlineProvider); ok {
 		if deadline, ok := provider.ResponseDeadline(); ok {
@@ -379,6 +393,13 @@ func (p *mcpProcessor) Process(ctx context.Context, cmd controlplane.PolledComma
 		channel = types.DefaultChannel
 	}
 	ctx = tunnelctx.ContextWithChannel(ctx, channel)
+
+	// Commands rejected at budget admission must be answered (when they carry
+	// a JSON-RPC request id) without ever connecting to the MCP server, so no
+	// tool operation can run or be replayed.
+	if payloadCarrier != nil && payloadCarrier.PayloadAdmissionError() != nil {
+		return p.rejectPayloadTooLarge(ctx, logger, cmd, channel, payloadCarrier.PayloadAdmissionError())
+	}
 
 	channelCfg, ok := p.channels[channel]
 	if !ok || !channelCfg.isRoutable() {
@@ -481,6 +502,50 @@ func (p *mcpProcessor) rejectUnsupportedChannel(ctx context.Context, logger *slo
 	}
 
 	return err
+}
+
+// rejectPayloadTooLarge answers a command rejected at link-budget admission.
+// It deliberately runs before any MCP transport connection is established, so
+// no tool operation executes. JSON-RPC requests receive a 413 JSON-RPC error
+// response; notifications cannot be answered per JSON-RPC and are dropped.
+func (p *mcpProcessor) rejectPayloadTooLarge(ctx context.Context, logger *slog.Logger, cmd controlplane.PolledCommand, channel types.Channel, admissionErr error) error {
+	const statusCode = http.StatusRequestEntityTooLarge
+	logger.WarnContext(ctx, "command rejected by the link payload byte budget; responding without executing the tool",
+		slog.String(tclog.FieldRequestID, cmd.RequestID().String()),
+		slog.String("channel", channel.String()),
+		slog.String("error", tclog.ErrorForLog(admissionErr)),
+	)
+
+	jsonCmd, ok := cmd.(controlplane.JsonRpcCommand)
+	if !ok {
+		// Non JSON-RPC commands (OAuth discovery, session termination) run no
+		// tools and have no JSON-RPC error channel; nothing more to deliver.
+		return nil
+	}
+	req, ok := jsonCmd.Message().(*jsonrpc.Request)
+	if !ok {
+		return nil
+	}
+	if !req.ID.IsValid() {
+		// JSON-RPC notifications must not receive a response.
+		logger.InfoContext(ctx, "dropping oversized JSON-RPC notification without response",
+			slog.String("rpc_method", req.Method))
+		return nil
+	}
+
+	encoded, encodeErr := buildJSONRPCErrorResponse(req, statusCode, admissionErr)
+	if encodeErr != nil {
+		return fmt.Errorf("build payload-too-large error response: %w", encodeErr)
+	}
+	respHeader := http.Header{}
+	respHeader.Set("Content-Type", "application/json")
+	response := types.NewTunnelResponse(channel, encoded, statusCode, respHeader)
+	post := p.postTunnelResponse(ctx, cmd.RequestID(), response)
+	if post.err != nil {
+		logger.ErrorContext(ctx, "failed to post payload-too-large error response to control plane", post.errorAttrs()...)
+		return post.err
+	}
+	return nil
 }
 
 func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.Logger, cmd controlplane.JsonRpcCommand, channelCfg channelConfig, channel types.Channel) error {
